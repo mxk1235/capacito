@@ -256,6 +256,69 @@ clang-tidy src/*.cc -- $(cat build/compile_commands.json | python3 -c "...")
 
 ---
 
+## SQL Schema Generation
+
+SQL DDL is generated automatically from annotated proto files in `proto/objects/` using `protoc` with a custom plugin. The plugin lives at `tools/protoc-gen-sql` and outputs `.sql` files into `schema/<dialect>/`. **Never hand-edit files in `schema/`** — they are regenerated and any manual changes will be overwritten.
+
+### Supported dialects
+
+| Dialect | Output path | Notes |
+|---|---|---|
+| `postgres` | `schema/postgres/<n>.sql` | Native enum types, triggers, `IF NOT EXISTS` |
+| `spanner` | `schema/spanner/<n>.sql` | `STRING`/`INT64`/`BOOL`, `CHECK` for enums, table-level `PRIMARY KEY`, `ALLOW_COMMIT_TIMESTAMP` |
+
+Run a single dialect with `./scripts/gen-schema.sh --dialect=postgres` or generate all at once with `./scripts/gen-schema.sh`.
+
+### How it works
+
+`protoc` fully parses the `.proto` files (resolving imports, types, and source location info) and passes a `CodeGeneratorRequest` to the plugin over stdin. The plugin builds a dialect-agnostic intermediate representation from the descriptor, then runs each dialect's emitter class against it independently. Adding a new dialect means adding a new `SqlEmitter` subclass and registering it in `_EMITTERS` — no changes to the parsing or IR code.
+
+### Adding a new object
+
+1. Create `proto/objects/<name>.proto` with a `message` definition.
+2. Annotate the message and fields with `sql:` comments (see below).
+3. Run the generator: `./scripts/gen-schema.sh`
+4. Commit both the `.proto` file and the generated `.sql` file together.
+
+CI enforces that `schema/` is always in sync with `proto/objects/` — a stale schema will fail the build.
+
+### Annotation reference
+
+| Annotation | Scope | Example | Effect |
+|---|---|---|---|
+| `sql:table=<n>` | Message | `// sql:table=projects` | Sets the SQL table name |
+| `sql:primary_key=<field>` | Message | `// sql:primary_key=id` | Marks a field as PRIMARY KEY |
+| `sql:type=<SQL TYPE>` | Field | `// sql:type=VARCHAR(64) NOT NULL` | Overrides inferred type for **all** dialects |
+| `sql:postgres_type=<TYPE>` | Field | `// sql:postgres_type=TIMESTAMPTZ NOT NULL` | Overrides inferred type for PostgreSQL only |
+| `sql:spanner_type=<TYPE>` | Field | `// sql:spanner_type=TIMESTAMP NOT NULL` | Overrides inferred type for Spanner only |
+| `sql:interleave_in=<table>` | Message | `// sql:interleave_in=users` | [Spanner] `INTERLEAVE IN PARENT` |
+| `sql:ignore` | Field | `// sql:ignore` | Excludes the field from all DDL |
+| `sql:index` | Field | `// sql:index` | Adds a plain index |
+| `sql:unique` | Field | `// sql:unique` | Adds a UNIQUE index |
+| `sql:references=<table(col)>` | Field | `// sql:references=users(id)` | Adds a FOREIGN KEY constraint |
+
+### Default proto to SQL type mappings
+
+| Proto type | SQL type |
+|---|---|
+| `string` | `TEXT` |
+| `int32` / `sint32` | `INTEGER` |
+| `int64` / `sint64` | `BIGINT` |
+| `float` | `REAL` |
+| `double` | `DOUBLE PRECISION` |
+| `bool` | `BOOLEAN` |
+| `bytes` | `BYTEA` |
+| `google.protobuf.Timestamp` | `TIMESTAMPTZ` |
+| enum (any) | PostgreSQL `CREATE TYPE ... AS ENUM` |
+| Nested message | `JSONB` (with a comment) |
+
+### Automatic behaviours
+
+- **Enums** are emitted as PostgreSQL `CREATE TYPE ... AS ENUM`. The `_UNSPECIFIED` sentinel is excluded and the `SCREAMING_SNAKE_CASE` prefix is stripped (e.g. `PROJECT_STATUS_ACTIVE` becomes `active`).
+- **updated_at trigger** — if a table has an `updated_at` column, a `set_updated_at()` function and `BEFORE UPDATE` trigger are emitted automatically.
+
+---
+
 ## Common Pitfalls
 
 | Pitfall | What to do instead |

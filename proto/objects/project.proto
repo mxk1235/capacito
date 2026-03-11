@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package capacito.v1.objects;
+
+import "google/protobuf/timestamp.proto";
+
+// sql:table=projects
+// sql:primary_key=id
+message Project {
+  // sql:type=VARCHAR(64) NOT NULL
+  string id = 1;
+
+  // sql:type=VARCHAR(255) NOT NULL
+  string name = 2;
+
+  // sql:type=VARCHAR(32) NOT NULL DEFAULT 'active'
+  ProjectStatus status = 3;
+
+  // sql:type=TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  google.protobuf.Timestamp created_at = 4;
+
+  // sql:type=TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  google.protobuf.Timestamp updated_at = 5;
+}
+
+enum ProjectStatus {
+  PROJECT_STATUS_UNSPECIFIED = 0;
+  PROJECT_STATUS_ACTIVE      = 1;
+  PROJECT_STATUS_TERMINATED  = 2;
+}
