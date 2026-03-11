@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify source layout
+        run: |
+          echo "Workspace: $GITHUB_WORKSPACE"
+          ls -la
+          test -f CMakeLists.txt || (echo "ERROR: CMakeLists.txt not found in $(pwd)" && exit 1)
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build \
+            libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+            libgtest-dev libgmock-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -GNinja
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
