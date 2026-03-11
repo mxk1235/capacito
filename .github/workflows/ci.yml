@@ -14,6 +14,9 @@ jobs:
   build-and-test:
     runs-on: ubuntu-24.04
 
+    container:
+      image: namely/protoc-all:1.15_0
+    
     steps:
       - uses: actions/checkout@v4
 
