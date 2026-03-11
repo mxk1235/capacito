@@ -7,6 +7,10 @@ on:
     branches: [main, master]
 
 jobs:
+
+  # ============================================================
+  # Job 1: Build, unit-test, and verify generated schema is fresh
+  # ============================================================
   build-and-test:
     runs-on: ubuntu-24.04
 
@@ -17,15 +21,17 @@ jobs:
         run: |
           echo "Workspace: $GITHUB_WORKSPACE"
           ls -la
-          test -f CMakeLists.txt || (echo "ERROR: CMakeLists.txt not found in $(pwd)" && exit 1)
+          test -f CMakeLists.txt || \
+            (echo "ERROR: CMakeLists.txt not found in $(pwd)" && exit 1)
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             cmake ninja-build \
-            libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
-            libgtest-dev libgmock-dev
+            libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc \
+            libgtest-dev libgmock-dev \
+            python3 python3-protobuf
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -GNinja
@@ -35,3 +41,131 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+      - name: Generate SQL schema
+        run: ./scripts/gen-schema.sh
+
+      - name: Check schema is up to date
+        run: |
+          git diff --exit-code schema/ || \
+            (echo "ERROR: schema/ is out of date. Run: ./scripts/gen-schema.sh" && exit 1)
+
+  # ============================================================
+  # Job 2: Deploy PostgreSQL schema to a real Postgres container
+  # ============================================================
+  schema-deploy-postgres:
+    runs-on: ubuntu-24.04
+    needs: build-and-test
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: capacito
+          POSTGRES_PASSWORD: capacito
+          POSTGRES_DB: capacito
+        ports:
+          - 5432:5432
+        # Health-check so the job waits until Postgres is actually accepting
+        # connections before our steps run.
+        options: >-
+          --health-cmd "pg_isready -U capacito"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Deploy PostgreSQL schema
+        env:
+          PGHOST: localhost
+          PGPORT: 5432
+          PGUSER: capacito
+          PGPASSWORD: capacito
+          PGDATABASE: capacito
+        run: ./scripts/deploy-schema-postgres.sh
+
+      - name: Smoke-test schema
+        env:
+          PGPASSWORD: capacito
+        run: |
+          # Verify each expected table exists
+          for table in projects; do
+            echo "Checking table: ${table}"
+            psql \
+              --host=localhost \
+              --username=capacito \
+              --dbname=capacito \
+              --tuples-only \
+              --command="SELECT to_regclass('public.${table}')::text" \
+            | grep -q "${table}" || \
+            (echo "ERROR: table '${table}' not found after deploy" && exit 1)
+          done
+          echo "All expected tables present."
+
+  # ============================================================
+  # Job 3: Deploy Spanner schema to the Cloud Spanner Emulator
+  # ============================================================
+  schema-deploy-spanner:
+    runs-on: ubuntu-24.04
+    needs: build-and-test
+
+    services:
+      spanner-emulator:
+        image: gcr.io/cloud-spanner-emulator/emulator:latest
+        ports:
+          - 9010:9010   # gRPC
+          - 9020:9020   # REST / HTTP
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gcloud CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-transport-https ca-certificates gnupg curl netcat-openbsd
+          curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] \
+            https://packages.cloud.google.com/apt cloud-sdk main" \
+            | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+          sudo apt-get update
+          sudo apt-get install -y google-cloud-cli
+
+      - name: Configure gcloud for emulator
+        run: |
+          # Use a dummy project — the emulator accepts any project name
+          gcloud config set project capacito-local
+          gcloud config set auth/disable_credentials true
+          gcloud config configurations activate default
+
+      - name: Deploy Spanner schema
+        env:
+          SPANNER_EMULATOR_HOST: localhost:9010
+          SPANNER_PROJECT: capacito-local
+          SPANNER_INSTANCE: capacito
+          SPANNER_DATABASE: capacito
+        run: ./scripts/deploy-schema-spanner.sh
+
+      - name: Smoke-test schema
+        env:
+          SPANNER_EMULATOR_HOST: localhost:9010
+        run: |
+          # List tables in the database and verify expected ones are present
+          TABLES=$(gcloud spanner databases ddl describe capacito \
+            --instance=capacito \
+            --project=capacito-local \
+            --quiet)
+
+          for table in projects; do
+            echo "Checking table: ${table}"
+            echo "${TABLES}" | grep -qi "CREATE TABLE ${table}" || \
+              (echo "ERROR: table '${table}' not found in Spanner DDL" && exit 1)
+          done
+          echo "All expected tables present."

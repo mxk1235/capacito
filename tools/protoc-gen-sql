@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""
+protoc-gen-sql — protoc plugin that generates SQL DDL from .proto files.
+
+Supports multiple SQL dialects selectable via the protoc parameter option:
+
+    protoc --sql_opt=dialect=postgres ...
+    protoc --sql_opt=dialect=spanner ...
+
+If no dialect is specified (or dialect=all), all dialects are generated,
+each written to a subdirectory of the output path:
+
+    schema/postgres/project.sql
+    schema/spanner/project.sql
+
+Usage:
+    protoc \\
+        --proto_path=proto \\
+        --proto_path=/usr/include \\
+        --plugin=protoc-gen-sql=tools/protoc-gen-sql \\
+        --sql_out=schema \\
+        proto/objects/project.proto
+
+Annotation syntax (via leading comments on messages and fields):
+
+    Message-level:
+        // sql:table=<n>                  Override table name (default: snake_plural)
+        // sql:primary_key=<field>        Mark a field as PRIMARY KEY
+        // sql:interleave_in=<table>      [Spanner only] INTERLEAVE IN PARENT <table>
+
+    Field-level:
+        // sql:type=<SQL TYPE>            Override inferred type for all dialects
+        // sql:spanner_type=<TYPE>        Override inferred type for Spanner only
+        // sql:postgres_type=<TYPE>       Override inferred type for PostgreSQL only
+        // sql:ignore                     Exclude this field from all DDL
+        // sql:index                      Add a plain index
+        // sql:unique                     Add a UNIQUE index
+        // sql:references=<table(col)>    Add a FOREIGN KEY constraint
+"""
+
+import re
+import sys
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Optional
+
+from google.protobuf.compiler import plugin_pb2
+from google.protobuf import descriptor_pb2
+
+
+# ---------------------------------------------------------------------------
+# Shared descriptor helpers
+# ---------------------------------------------------------------------------
+
+_ANNOTATION_RE = re.compile(r"sql:([\w]+)(?:=(.+))?")
+_FILE_MESSAGE = 4
+_MSG_FIELD    = 2
+
+
+def _parse_annotations(comment: str) -> dict:
+    result = {}
+    for line in comment.splitlines():
+        m = _ANNOTATION_RE.search(line)
+        if m:
+            key = m.group(1)
+            result[key] = m.group(2).strip() if m.group(2) else True
+    return result
+
+
+def _leading_comment(source_info, path):
+    for loc in source_info.location:
+        if list(loc.path) == path:
+            return loc.leading_comments
+    return ""
+
+
+def _pascal_to_snake(name: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+
+def _enum_type_name(fully_qualified: str) -> str:
+    return _pascal_to_snake(fully_qualified.rsplit(".", 1)[-1])
+
+
+def _strip_enum_prefix(value_name: str, enum_type_name: str) -> str:
+    prefix = _pascal_to_snake(enum_type_name).upper() + "_"
+    if value_name.startswith(prefix):
+        return value_name[len(prefix):].lower()
+    return value_name.lower()
+
+
+# ---------------------------------------------------------------------------
+# Dialect-agnostic intermediate representation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ColumnIR:
+    name: str
+    proto_type: int
+    proto_type_name: str
+    annotations: dict
+    is_primary_key: bool = False
+
+
+@dataclass
+class EnumIR:
+    fqn: str
+    name: str
+    values: list   # non-zero value names
+
+
+@dataclass
+class TableIR:
+    table_name: str
+    columns: list
+    enums_referenced: list
+    annotations: dict
+    source_proto: str
+
+
+def _build_table_ir(proto_file, msg_idx: int) -> TableIR:
+    msg = proto_file.message_type[msg_idx]
+    source_info = proto_file.source_code_info
+    pkg_prefix = f".{proto_file.package}" if proto_file.package else ""
+
+    enums_by_fqn = {
+        f"{pkg_prefix}.{e.name}": e for e in proto_file.enum_type
+    }
+
+    msg_comment = _leading_comment(source_info, [_FILE_MESSAGE, msg_idx])
+    msg_ann = _parse_annotations(msg_comment)
+    table_name = msg_ann.get("table", _pascal_to_snake(msg.name) + "s")
+    primary_key = msg_ann.get("primary_key")
+
+    columns = []
+    seen_enum_fqns = set()
+    enums_referenced = []
+
+    for field_idx, f in enumerate(msg.field):
+        field_comment = _leading_comment(
+            source_info, [_FILE_MESSAGE, msg_idx, _MSG_FIELD, field_idx]
+        )
+        field_ann = _parse_annotations(field_comment)
+        if field_ann.get("ignore"):
+            continue
+
+        if f.type == descriptor_pb2.FieldDescriptorProto.TYPE_ENUM:
+            fqn = f.type_name
+            if fqn not in seen_enum_fqns and fqn in enums_by_fqn:
+                enum_desc = enums_by_fqn[fqn]
+                enums_referenced.append(EnumIR(
+                    fqn=fqn,
+                    name=enum_desc.name,
+                    values=[v.name for v in enum_desc.value if v.number != 0],
+                ))
+                seen_enum_fqns.add(fqn)
+
+        columns.append(ColumnIR(
+            name=f.name,
+            proto_type=f.type,
+            proto_type_name=f.type_name,
+            annotations=field_ann,
+            is_primary_key=(f.name == primary_key),
+        ))
+
+    return TableIR(
+        table_name=table_name,
+        columns=columns,
+        enums_referenced=enums_referenced,
+        annotations=msg_ann,
+        source_proto=proto_file.name,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Emitter base
+# ---------------------------------------------------------------------------
+
+class SqlEmitter(ABC):
+    dialect: str
+
+    @abstractmethod
+    def emit_file(self, tables: list, source_proto: str) -> str: ...
+
+    def _header(self, source_proto: str) -> list:
+        return [
+            f"-- [{self.dialect.upper()}] DDL generated from {source_proto}",
+            "-- DO NOT EDIT — regenerate with: ./scripts/gen-schema.sh",
+            "",
+        ]
+
+    def _section_header(self, table: TableIR) -> list:
+        return [
+            f"-- {'=' * 60}",
+            f"-- Table: {table.table_name}",
+            f"-- {'=' * 60}",
+            "",
+        ]
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL emitter
+# ---------------------------------------------------------------------------
+
+_PG_SCALAR = {
+    descriptor_pb2.FieldDescriptorProto.TYPE_STRING:   "TEXT",
+    descriptor_pb2.FieldDescriptorProto.TYPE_BYTES:    "BYTEA",
+    descriptor_pb2.FieldDescriptorProto.TYPE_BOOL:     "BOOLEAN",
+    descriptor_pb2.FieldDescriptorProto.TYPE_FLOAT:    "REAL",
+    descriptor_pb2.FieldDescriptorProto.TYPE_DOUBLE:   "DOUBLE PRECISION",
+    descriptor_pb2.FieldDescriptorProto.TYPE_INT32:    "INTEGER",
+    descriptor_pb2.FieldDescriptorProto.TYPE_SINT32:   "INTEGER",
+    descriptor_pb2.FieldDescriptorProto.TYPE_SFIXED32: "INTEGER",
+    descriptor_pb2.FieldDescriptorProto.TYPE_UINT32:   "INTEGER",
+    descriptor_pb2.FieldDescriptorProto.TYPE_FIXED32:  "INTEGER",
+    descriptor_pb2.FieldDescriptorProto.TYPE_INT64:    "BIGINT",
+    descriptor_pb2.FieldDescriptorProto.TYPE_SINT64:   "BIGINT",
+    descriptor_pb2.FieldDescriptorProto.TYPE_SFIXED64: "BIGINT",
+    descriptor_pb2.FieldDescriptorProto.TYPE_UINT64:   "BIGINT",
+    descriptor_pb2.FieldDescriptorProto.TYPE_FIXED64:  "BIGINT",
+}
+
+_PG_WELL_KNOWN = {
+    ".google.protobuf.Timestamp": "TIMESTAMPTZ",
+    ".google.protobuf.Duration":  "INTERVAL",
+}
+
+
+class PostgresEmitter(SqlEmitter):
+    dialect = "postgres"
+
+    def _pg_type(self, col: ColumnIR) -> str:
+        if "postgres_type" in col.annotations:
+            return col.annotations["postgres_type"]
+        if "type" in col.annotations:
+            return col.annotations["type"]
+        if col.proto_type == descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE:
+            return _PG_WELL_KNOWN.get(col.proto_type_name, f"JSONB  /* {col.proto_type_name} */")
+        if col.proto_type == descriptor_pb2.FieldDescriptorProto.TYPE_ENUM:
+            return _enum_type_name(col.proto_type_name)
+        return _PG_SCALAR.get(col.proto_type, "TEXT")
+
+    def emit_file(self, tables: list, source_proto: str) -> str:
+        lines = self._header(source_proto)
+
+        for table in tables:
+            lines += self._section_header(table)
+
+            for enum in table.enums_referenced:
+                pg_type = _enum_type_name(enum.fqn)
+                values = ", ".join(
+                    f"'{_strip_enum_prefix(v, enum.name)}'" for v in enum.values
+                )
+                lines.append(f"CREATE TYPE {pg_type} AS ENUM ({values});")
+            if table.enums_referenced:
+                lines.append("")
+
+            col_defs = []
+            fk_constraints = []
+            index_stmts = []
+            has_updated_at = False
+
+            for col in table.columns:
+                if col.name == "updated_at":
+                    has_updated_at = True
+                parts = [f"    {col.name}", self._pg_type(col)]
+                if col.is_primary_key:
+                    parts.append("PRIMARY KEY")
+                col_defs.append(" ".join(parts))
+
+                if col.annotations.get("references"):
+                    fk_constraints.append(
+                        f"    CONSTRAINT fk_{table.table_name}_{col.name}"
+                        f" FOREIGN KEY ({col.name}) REFERENCES {col.annotations['references']}"
+                    )
+                if col.annotations.get("unique"):
+                    index_stmts.append(
+                        f"CREATE UNIQUE INDEX IF NOT EXISTS uq_{table.table_name}_{col.name}"
+                        f" ON {table.table_name} ({col.name});"
+                    )
+                elif col.annotations.get("index"):
+                    index_stmts.append(
+                        f"CREATE INDEX IF NOT EXISTS idx_{table.table_name}_{col.name}"
+                        f" ON {table.table_name} ({col.name});"
+                    )
+
+            all_defs = col_defs + fk_constraints
+            lines.append(f"CREATE TABLE IF NOT EXISTS {table.table_name} (")
+            for i, d in enumerate(all_defs):
+                lines.append(d + ("," if i < len(all_defs) - 1 else ""))
+            lines += [");", ""]
+
+            if index_stmts:
+                lines += index_stmts + [""]
+
+            if has_updated_at:
+                lines += [
+                    "-- Auto-update trigger for updated_at",
+                    "CREATE OR REPLACE FUNCTION set_updated_at()",
+                    "RETURNS TRIGGER LANGUAGE plpgsql AS $$",
+                    "BEGIN",
+                    "    NEW.updated_at = NOW();",
+                    "    RETURN NEW;",
+                    "END;",
+                    "$$;",
+                    "",
+                    f"CREATE OR REPLACE TRIGGER trg_{table.table_name}_updated_at",
+                    f"BEFORE UPDATE ON {table.table_name}",
+                    f"FOR EACH ROW EXECUTE FUNCTION set_updated_at();",
+                    "",
+                ]
+
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Spanner emitter
+# ---------------------------------------------------------------------------
+#
+# Key differences from PostgreSQL:
+#   - No CREATE TYPE AS ENUM  →  STRING(64) + CHECK constraint
+#   - INT64 for all integer types (no INTEGER/BIGINT distinction)
+#   - STRING(MAX) for strings, BYTES(MAX) for bytes
+#   - BOOL (not BOOLEAN), FLOAT64 (not DOUBLE PRECISION), FLOAT32 (not REAL)
+#   - TIMESTAMP (not TIMESTAMPTZ)
+#   - PRIMARY KEY is a table-level clause, not inline on the column
+#   - No IF NOT EXISTS on CREATE TABLE
+#   - UNIQUE indexes use CREATE UNIQUE NULL_FILTERED INDEX
+#   - No triggers — updated_at must be maintained by the application
+#     or via ALLOW_COMMIT_TIMESTAMP
+#   - Supports INTERLEAVE IN PARENT for table locality
+
+_SPANNER_SCALAR = {
+    descriptor_pb2.FieldDescriptorProto.TYPE_STRING:   "STRING(MAX)",
+    descriptor_pb2.FieldDescriptorProto.TYPE_BYTES:    "BYTES(MAX)",
+    descriptor_pb2.FieldDescriptorProto.TYPE_BOOL:     "BOOL",
+    descriptor_pb2.FieldDescriptorProto.TYPE_FLOAT:    "FLOAT32",
+    descriptor_pb2.FieldDescriptorProto.TYPE_DOUBLE:   "FLOAT64",
+    descriptor_pb2.FieldDescriptorProto.TYPE_INT32:    "INT64",
+    descriptor_pb2.FieldDescriptorProto.TYPE_SINT32:   "INT64",
+    descriptor_pb2.FieldDescriptorProto.TYPE_SFIXED32: "INT64",
+    descriptor_pb2.FieldDescriptorProto.TYPE_UINT32:   "INT64",
+    descriptor_pb2.FieldDescriptorProto.TYPE_FIXED32:  "INT64",
+    descriptor_pb2.FieldDescriptorProto.TYPE_INT64:    "INT64",
+    descriptor_pb2.FieldDescriptorProto.TYPE_SINT64:   "INT64",
+    descriptor_pb2.FieldDescriptorProto.TYPE_SFIXED64: "INT64",
+    descriptor_pb2.FieldDescriptorProto.TYPE_UINT64:   "INT64",
+    descriptor_pb2.FieldDescriptorProto.TYPE_FIXED64:  "INT64",
+}
+
+_SPANNER_WELL_KNOWN = {
+    ".google.protobuf.Timestamp": "TIMESTAMP",
+    ".google.protobuf.Duration":  "INT64",  # no native interval; store microseconds
+}
+
+
+class SpannerEmitter(SqlEmitter):
+    dialect = "spanner"
+
+    def _spanner_type(self, col: ColumnIR) -> str:
+        if "spanner_type" in col.annotations:
+            return col.annotations["spanner_type"]
+        if "type" in col.annotations:
+            return col.annotations["type"]
+        if col.proto_type == descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE:
+            return _SPANNER_WELL_KNOWN.get(col.proto_type_name, "JSON  /* nested message */")
+        if col.proto_type == descriptor_pb2.FieldDescriptorProto.TYPE_ENUM:
+            return "STRING(64)"
+        return _SPANNER_SCALAR.get(col.proto_type, "STRING(MAX)")
+
+    def emit_file(self, tables: list, source_proto: str) -> str:
+        lines = self._header(source_proto)
+        lines += [
+            "-- NOTE: Spanner has no native enum type.",
+            "--       Enum columns use STRING(64) with a CHECK constraint.",
+            "-- NOTE: Spanner has no trigger support.",
+            "--       updated_at must be maintained by the application,",
+            "--       or use ALLOW_COMMIT_TIMESTAMP on a TIMESTAMP column.",
+            "",
+        ]
+
+        for table in tables:
+            lines += self._section_header(table)
+
+            enum_values_by_fqn = {
+                e.fqn: [_strip_enum_prefix(v, e.name) for v in e.values]
+                for e in table.enums_referenced
+            }
+
+            col_defs = []
+            check_constraints = []
+            fk_constraints = []
+            index_stmts = []
+            primary_key_cols = []
+
+            for col in table.columns:
+                sql_type = self._spanner_type(col)
+                col_defs.append(f"    {col.name} {sql_type}")
+
+                if col.is_primary_key:
+                    primary_key_cols.append(col.name)
+
+                if (col.proto_type == descriptor_pb2.FieldDescriptorProto.TYPE_ENUM
+                        and col.proto_type_name in enum_values_by_fqn):
+                    allowed = ", ".join(
+                        f"'{v}'" for v in enum_values_by_fqn[col.proto_type_name]
+                    )
+                    check_constraints.append(
+                        f"    CONSTRAINT chk_{table.table_name}_{col.name}"
+                        f" CHECK ({col.name} IN ({allowed}))"
+                    )
+
+                if col.annotations.get("references"):
+                    fk_constraints.append(
+                        f"    CONSTRAINT fk_{table.table_name}_{col.name}"
+                        f" FOREIGN KEY ({col.name}) REFERENCES {col.annotations['references']}"
+                    )
+
+                if col.annotations.get("unique"):
+                    index_stmts.append(
+                        f"CREATE UNIQUE NULL_FILTERED INDEX"
+                        f" uq_{table.table_name}_{col.name}"
+                        f" ON {table.table_name} ({col.name});"
+                    )
+                elif col.annotations.get("index"):
+                    index_stmts.append(
+                        f"CREATE INDEX idx_{table.table_name}_{col.name}"
+                        f" ON {table.table_name} ({col.name});"
+                    )
+
+            pk_clause = (
+                f"PRIMARY KEY ({', '.join(primary_key_cols)})"
+                if primary_key_cols else "PRIMARY KEY ()"
+            )
+
+            all_defs = col_defs + check_constraints + fk_constraints
+            lines.append(f"CREATE TABLE {table.table_name} (")
+            for d in all_defs:
+                lines.append(d + ",")
+            lines.append(f") {pk_clause}")
+
+            interleave = table.annotations.get("interleave_in")
+            if interleave:
+                lines.append(f", INTERLEAVE IN PARENT {interleave} ON DELETE CASCADE")
+
+            lines[-1] += ";"
+            lines.append("")
+
+            if index_stmts:
+                lines += index_stmts + [""]
+
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Dialect registry
+# ---------------------------------------------------------------------------
+
+_EMITTERS = {
+    "postgres": PostgresEmitter(),
+    "spanner":  SpannerEmitter(),
+}
+
+ALL_DIALECTS = list(_EMITTERS.keys())
+
+
+# ---------------------------------------------------------------------------
+# Plugin entrypoint
+# ---------------------------------------------------------------------------
+
+def _parse_options(parameter: str) -> dict:
+    opts = {}
+    for part in (parameter or "").split(","):
+        part = part.strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            opts[k.strip()] = v.strip()
+    return opts
+
+
+def main() -> None:
+    data = sys.stdin.buffer.read()
+    request = plugin_pb2.CodeGeneratorRequest()
+    request.ParseFromString(data)
+
+    opts = _parse_options(request.parameter)
+    requested_dialect = opts.get("dialect", "all")
+
+    if requested_dialect == "all":
+        dialects_to_emit = ALL_DIALECTS
+    elif requested_dialect in _EMITTERS:
+        dialects_to_emit = [requested_dialect]
+    else:
+        sys.stderr.write(
+            f"protoc-gen-sql: unknown dialect '{requested_dialect}'. "
+            f"Valid options: {', '.join(ALL_DIALECTS)}, all\n"
+        )
+        sys.exit(1)
+
+    response = plugin_pb2.CodeGeneratorResponse()
+    response.supported_features = (
+        plugin_pb2.CodeGeneratorResponse.FEATURE_PROTO3_OPTIONAL
+    )
+
+    all_files = {f.name: f for f in request.proto_file}
+
+    for fname in request.file_to_generate:
+        proto_file = all_files[fname]
+        if not proto_file.message_type:
+            continue
+
+        tables = [
+            _build_table_ir(proto_file, i)
+            for i in range(len(proto_file.message_type))
+        ]
+
+        stem = fname.replace("proto/objects/", "").replace(".proto", "")
+
+        for dialect in dialects_to_emit:
+            emitter = _EMITTERS[dialect]
+            ddl = emitter.emit_file(tables, fname)
+            out = response.file.add()
+            out.name = f"{dialect}/{stem}.sql"
+            out.content = ddl
+
+    sys.stdout.buffer.write(response.SerializeToString())
+
+
+if __name__ == "__main__":
+    main()
