@@ -1,0 +1,24 @@
+# Build artifacts
+build/
+out/
+cmake-build-*/
+
+# Generated protobuf/gRPC sources (regenerated at build time)
+**/generated/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.orig
+
+# OS
+.DS_Store
+Thumbs.db

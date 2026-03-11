@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package capacito.v1;
+
+option cc_generic_services = false;
+
+// Example skeleton — replace with your actual API design:
+
+service CapacitoService {
+  rpc ExampleUnary (ExampleRequest) returns (ExampleResponse);
+  rpc ExampleServerStream (ExampleRequest) returns (stream ExampleResponse);
+  rpc ExampleClientStream (stream ExampleRequest) returns (ExampleResponse);
+  rpc ExampleBidiStream (stream ExampleRequest) returns (stream ExampleResponse);
+}
+
+message ExampleRequest {
+  string id = 1;
+}
+
+message ExampleResponse {
+  string result = 1;
+}
