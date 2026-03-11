@@ -217,6 +217,54 @@ TEST(CapacitoServiceTest, GetWidget_ReturnsInvalidArgument_WhenIdIsEmpty) {
 
 ---
 
+## CI Architecture
+
+The CI pipeline is split into three jobs, each with a distinct responsibility:
+
+```
+build-and-test
+    │
+    ├── schema-deploy-postgres
+    └── schema-deploy-spanner
+```
+
+`build-and-test` runs first and gates both deploy jobs via `needs:`. It compiles the service, runs unit tests, regenerates schema from proto, and verifies the committed schema files are up to date. If this job fails, neither deploy job runs.
+
+`schema-deploy-postgres` spins up a `postgres:16` service container (managed natively by GitHub Actions), runs `./scripts/deploy-schema-postgres.sh`, then smoke-tests that the expected tables exist.
+
+`schema-deploy-spanner` spins up the `gcr.io/cloud-spanner-emulator/emulator` service container, installs `gcloud`, runs `./scripts/deploy-schema-spanner.sh`, then smoke-tests the deployed DDL via `gcloud spanner databases ddl describe`.
+
+### Deploy scripts
+
+The deploy scripts in `scripts/` are designed to work both in CI and locally:
+
+| Script | Purpose |
+|---|---|
+| `scripts/deploy-schema-postgres.sh` | Apply `schema/postgres/*.sql` to a Postgres instance |
+| `scripts/deploy-schema-spanner.sh` | Apply `schema/spanner/*.sql` to Spanner (real or emulator) |
+
+Both scripts wait for their backend to be ready before applying DDL, so they are safe to run immediately after starting a container.
+
+**Local Postgres:**
+```bash
+docker run -d --name capacito-pg   -e POSTGRES_USER=capacito   -e POSTGRES_PASSWORD=capacito   -e POSTGRES_DB=capacito   -p 5432:5432   postgres:16
+
+./scripts/deploy-schema-postgres.sh
+```
+
+**Local Spanner emulator:**
+```bash
+docker run -d --name capacito-spanner   -p 9010:9010 -p 9020:9020   gcr.io/cloud-spanner-emulator/emulator
+
+SPANNER_EMULATOR_HOST=localhost:9010 ./scripts/deploy-schema-spanner.sh
+```
+
+### Adding a new table to the smoke tests
+
+When you add a new object proto, add its table name to the `for table in ...` loop in both deploy jobs inside `.github/workflows/ci.yml`. This ensures CI catches a failed deployment rather than silently succeeding with a missing table.
+
+---
+
 ## Build & Tooling
 
 ### Prerequisites
